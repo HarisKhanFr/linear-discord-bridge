@@ -109,15 +109,17 @@ function sendDiscordMessage({ title, identifier, url, priorityNum, description, 
       ? projects.join(", ")
       : "No Project";
 
-    const metaRow = `**Priority:** ${label}\u2003\u2003•\u2003\u2003**Project:** ${projectText}`;
+    const metaRow = `**Priority:** ${label}\u2003•\u2003**Project:** ${projectText}`;
 
     const viewLink = url ? `**[View in Linear →](${url})**` : "";
 
-    const embedTitle = identifier
-      ? `${identifier}: ${title}`
-      : title;
+    // Big heading using Discord markdown (only works in description, not embed title)
+    const headingTitle = identifier
+      ? `# ${identifier}: ${title}`
+      : `# ${title}`;
 
     const lines = [
+      headingTitle,
       metaRow,
       "",
       `> ${descriptionText}`
@@ -130,7 +132,6 @@ function sendDiscordMessage({ title, identifier, url, priorityNum, description, 
 
     const embed = {
       color,
-      title: embedTitle,
       description: lines.join("\n"),
       footer: { text: "Linear" },
       timestamp: new Date().toISOString(),
