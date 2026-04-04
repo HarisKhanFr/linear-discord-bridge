@@ -8,10 +8,11 @@ const { URL } = require("url");
 const app  = express();
 const PORT = process.env.PORT || 3000;
 
+// raw body needed for signature verification
 app.use(express.raw({ type: "application/json" }));
 
 app.get("/", (_req, res) => {
-  res.status(200).send("Linear → Discord bridge is running ✅");
+  res.status(200).send("Linear -> Discord bridge is running ✅");
 });
 
 app.post("/webhook", async (req, res) => {
@@ -19,10 +20,12 @@ app.post("/webhook", async (req, res) => {
   const secret    = process.env.LINEAR_WEBHOOK_SECRET;
 
   if (!secret) {
+    log("error", "LINEAR_WEBHOOK_SECRET not set");
     return res.status(500).json({ error: "Server misconfiguration." });
   }
 
-  if (!verifyLinearSignature(req.body, signature, secret)) {
+  if (!verifySignature(req.body, signature, secret)) {
+    log("warn", "Invalid signature — rejected");
     return res.status(401).json({ error: "Invalid signature." });
   }
 
@@ -39,129 +42,109 @@ app.post("/webhook", async (req, res) => {
     return res.status(200).json({ message: "Ignored" });
   }
 
-  const title       = data?.title       || "Untitled Issue";
-  const identifier  = data?.identifier  || "";
-  const url         = data?.url         || null;
-  const priorityNum = data?.priority    ?? 0;
-  const description = data?.description || null;
-
-  const projects = data?.project
-    ? [data.project.name]
-    : data?.projects?.nodes?.map(p => p.name) || [];
+  const issue = parseIssue(data);
+  log("info", `New issue: ${issue.identifier} – ${issue.title}`);
 
   try {
-    await sendDiscordMessage({
-      title,
-      identifier,
-      url,
-      priorityNum,
-      description,
-      projects
-    });
+    await sendDiscordEmbed(issue);
     return res.status(200).json({ message: "OK" });
-  } catch {
-    return res.status(200).json({ message: "Discord failed" });
+  } catch (err) {
+    // 200 so Linear doesn't retry
+    log("error", `Discord failed: ${err.message}`);
+    return res.status(200).json({ message: "Discord delivery failed" });
   }
 });
 
 // ─────────────────────────────────────────────────────────────
 
-function verifyLinearSignature(body, signature, secret) {
+function log(level, message) {
+  const out = `[${new Date().toISOString()}] [${level.toUpperCase()}] ${message}`;
+  if (level === "error") console.error(out);
+  else if (level === "warn") console.warn(out);
+  else console.log(out);
+}
+
+function verifySignature(body, signature, secret) {
   if (!signature) return false;
   try {
-    const digest = crypto
-      .createHmac("sha256", secret)
-      .update(body)
-      .digest("hex");
-
-    return crypto.timingSafeEqual(
-      Buffer.from(signature, "utf8"),
-      Buffer.from(digest,    "utf8")
-    );
+    const digest = crypto.createHmac("sha256", secret).update(body).digest("hex");
+    const a = Buffer.from(signature, "utf8");
+    const b = Buffer.from(digest, "utf8");
+    if (a.length !== b.length) return false;
+    return crypto.timingSafeEqual(a, b);
   } catch {
     return false;
   }
 }
 
-function priorityInfo(priority) {
-  const map = {
-    0: { label: "No Priority", color: 0x95a5a6 },
-    1: { label: "Urgent",      color: 0xe74c3c },
-    2: { label: "High",        color: 0xe67e22 },
-    3: { label: "Medium",      color: 0xf1c40f },
-    4: { label: "Low",         color: 0x3498db },
+function parseIssue(data) {
+  return {
+    title:       data?.title       || "Untitled Issue",
+    identifier:  data?.identifier  || "",
+    url:         data?.url         || null,
+    priority:    data?.priority    ?? 0,
+    description: data?.description || null,
+    projects:    data?.project
+      ? [data.project.name]
+      : (data?.projects?.nodes?.map(p => p.name) ?? []),
   };
-  return map[priority] ?? map[0];
 }
 
-function sendDiscordMessage({ title, identifier, url, priorityNum, description, projects }) {
+const PRIORITY = {
+  0: { label: "No Priority", color: 0x95a5a6 },
+  1: { label: "Urgent",      color: 0xe74c3c },
+  2: { label: "High",        color: 0xe67e22 },
+  3: { label: "Medium",      color: 0xf1c40f },
+  4: { label: "Low",         color: 0x3498db },
+};
+
+function sendDiscordEmbed({ title, identifier, url, priority, description, projects }) {
   return new Promise((resolve, reject) => {
     const webhookUrl = process.env.DISCORD_WEBHOOK_URL;
-    if (!webhookUrl) return reject(new Error("Missing webhook URL"));
+    if (!webhookUrl) return reject(new Error("DISCORD_WEBHOOK_URL not set"));
 
-    const { label, color } = priorityInfo(priorityNum);
+    const { label, color } = PRIORITY[priority] ?? PRIORITY[0];
 
-    const descriptionText = description
+    const desc = description
       ? description.slice(0, 300) + (description.length > 300 ? "…" : "")
       : "*No description provided.*";
 
-    const projectText = projects.length > 0
-      ? projects.join(", ")
-      : "No Project";
+    const heading  = identifier ? `# ${identifier}: ${title}` : `# ${title}`;
+    const meta     = `**Priority:** ${label}\u2003•\u2003**Project:** ${projects.join(", ") || "No Project"}`;
+    const viewLink = url ? `**[View in Linear ->](${url})**` : "";
 
-    const metaRow = `**Priority:** ${label}\u2003•\u2003**Project:** ${projectText}`;
-
-    const viewLink = url ? `**[View in Linear →](${url})**` : "";
-
-    // Big heading using Discord markdown (only works in description, not embed title)
-    const headingTitle = identifier
-      ? `# ${identifier}: ${title}`
-      : `# ${title}`;
-
-    const lines = [
-      headingTitle,
-      metaRow,
-      "",
-      `> ${descriptionText}`
-    ];
-
-    if (viewLink) {
-      lines.push("");
-      lines.push(viewLink);
-    }
+    const lines = [heading, meta, "", `> ${desc}`];
+    if (viewLink) lines.push("", viewLink);
 
     const embed = {
       color,
       description: lines.join("\n"),
-      footer: { text: "Linear" },
-      timestamp: new Date().toISOString(),
+      footer:      { text: "Linear" },
+      timestamp:   new Date().toISOString(),
     };
 
-    const body = JSON.stringify({ embeds: [embed] });
-
+    const body   = JSON.stringify({ embeds: [embed] });
     const parsed = new URL(webhookUrl);
 
-    const options = {
-      hostname: parsed.hostname,
-      path: parsed.pathname + parsed.search,
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "Content-Length": Buffer.byteLength(body),
+    const req = https.request(
+      {
+        hostname: parsed.hostname,
+        path:     parsed.pathname + parsed.search,
+        method:   "POST",
+        headers:  {
+          "Content-Type":   "application/json",
+          "Content-Length": Buffer.byteLength(body),
+        },
       },
-    };
-
-    const req = https.request(options, (res) => {
-      let raw = "";
-      res.on("data", (chunk) => (raw += chunk));
-      res.on("end", () => {
-        if (res.statusCode >= 200 && res.statusCode < 300) {
-          resolve();
-        } else {
-          reject(new Error(`Discord error ${res.statusCode}`));
-        }
-      });
-    });
+      (res) => {
+        let raw = "";
+        res.on("data", (chunk) => (raw += chunk));
+        res.on("end", () => {
+          if (res.statusCode >= 200 && res.statusCode < 300) resolve();
+          else reject(new Error(`Discord ${res.statusCode}: ${raw.slice(0, 200)}`));
+        });
+      }
+    );
 
     req.on("error", reject);
     req.write(body);
@@ -169,11 +152,10 @@ function sendDiscordMessage({ title, identifier, url, priorityNum, description, 
   });
 }
 
-// Keep local dev working, but export for Vercel
+// ─────────────────────────────────────────────────────────────
+
 if (require.main === module) {
-  app.listen(PORT, () => {
-    console.log(`🚀 Running on port ${PORT}`);
-  });
+  app.listen(PORT, () => log("info", `Running on port ${PORT}`));
 }
 
 module.exports = app;
